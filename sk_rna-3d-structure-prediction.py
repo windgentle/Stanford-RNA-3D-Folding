@@ -17,7 +17,8 @@ from sklearn.model_selection import KFold
 
 
 #const
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'mps' if torch.backends.mps.is_available() else 'cpu' #'cuda' if torch.cuda.is_available() else 'cpu'
+
 #数据预处理
 # RNA_PARA_FILE = "/kaggle/input/rna-llm-parameter-file/"
 RNA_PARA_FILE = ""

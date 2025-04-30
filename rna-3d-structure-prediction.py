@@ -12,6 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 import os
 from tqdm import tqdm
 from sklearn.model_selection import KFold
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 #const
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -104,7 +105,7 @@ def encode_string(s, stoi):
 
 def rna_str_eval(input_str): #torch.Size([1, 10, 512])
     model = SimpleCharTransformerWithRoPE(vocab_size).to(device)
-    model.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device))
+    model.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device,weights_only=True))
     model.eval()  
 
     # 输入字符串
@@ -247,17 +248,17 @@ class RNN3DPredictor(nn.Module):
         return pred_coords
 
 def tm_score_loss(pred, target, confidence=None):
-    target = target.permute(0, 2, 1, 3)
+    # target = target.permute(0, 2, 1, 3)
     pred_struct = pred[:, :, 0, :]
     all_tm_scores = []
     for i in range(target.shape[2]):
         target_struct = target[:, :, i, :]
-       
         squared_dists = torch.sum((pred_struct - target_struct)**2, dim=-1) + 1e-8
         dists = torch.sqrt(torch.clamp(squared_dists, min=1e-8))
         seq_len = target.shape[1]
         adjusted_len = max(seq_len - 15, 1e-6)
-        d0 = 1.24 * adjusted_len**(1/3) - 1.8
+        d0 = max(1.24 * adjusted_len**(1/3) - 1.8,0.5)
+
         tm_score_components = 1 / (1 + (dists / d0)**2)
       
         if confidence is not None:
@@ -271,6 +272,75 @@ def tm_score_loss(pred, target, confidence=None):
     best_tm_scores = all_tm_scores.max(dim=1)[0]
     l2_reg = torch.mean(torch.norm(pred_struct, dim=2)) * 0.001
     return -best_tm_scores.mean() + l2_reg
+
+def mixed_tm_l2_loss(pred, target, alpha=10):
+    """
+    结合 TM-score 和 L2 损失的混合损失函数，适用于 RNA 3D 坐标预测。
+    
+    参数:
+    - pred: 模型预测的坐标，形状为 [B, T, K, 3]
+    - target: 真实的坐标，形状为 [B, T, K, 3]
+    - alpha: L2 损失的权重系数
+    
+    返回:
+    - 综合损失值
+    """
+    # 确保输入形状一致
+    B, T, K, _ = pred.shape
+    assert pred.shape == target.shape, "预测和目标的形状必须一致"
+
+    # TM-score 计算
+    all_tm_scores = []
+    for k in range(K):
+        pred_struct = pred[:, :, k, :]     # [B, T, 3]
+        target_struct = target[:, :, k, :] # [B, T, 3]
+
+        # Pairwise L2 distance per point
+        squared_dists = torch.sum((pred_struct - target_struct)**2, dim=-1) + 1e-8  # [B, T]
+        dists = torch.sqrt(torch.clamp(squared_dists, min=1e-8))                   # [B, T]
+
+        # TM-score 计算规则
+        seq_len = T  # 序列长度
+        adjusted_len = max(seq_len - 15, 1e-6)  # 调整长度，避免负值
+        d0 = max(1.24 * adjusted_len**(1/3) - 1.8, 0.5)  # TM-score 调节因子
+
+        # 计算 TM-score 分量
+        tm_score_components = 1 / (1 + (dists / d0)**2)  # [B, T]
+
+        # 对序列取平均
+        tm_scores = tm_score_components.mean(dim=1)  # [B]
+        all_tm_scores.append(tm_scores)
+
+    # 所有 K 种预测中取最佳 TM-score
+    all_tm_scores = torch.stack(all_tm_scores, dim=1)  # [B, K]
+    best_tm_scores = all_tm_scores.max(dim=1)[0]       # [B]
+
+    # L2 损失计算
+    pred_l2 = pred[:, :, 0, :]     # 仅对第一个候选坐标计算 L2 损失 [B, T, 3]
+    target_l2 = target[:, :, 0, :] # [B, T, 3]
+    l2_loss = F.mse_loss(pred_l2, target_l2)
+
+    # 小 L2 正则化（可选）
+    l2_reg = torch.mean(torch.norm(pred_l2, dim=2)) * 0.001
+
+    # 综合损失
+    loss = -best_tm_scores.mean() + alpha * l2_loss + l2_reg
+    return loss
+
+def rna_mse_loss(pred, target):
+    B, T, K, _ = pred.shape
+    assert pred.shape == target.shape, "预测和目标的形状必须一致"
+    pred_l2 = pred[:, :, 0, :]     # 仅对第一个候选坐标计算 L2 损失 [B, T, 3]
+    target_l2 = target[:, :, 0, :] # [B, T, 3]
+    l2_loss = F.mse_loss(pred_l2, target_l2)
+
+    # 小 L2 正则化（可选）
+    l2_reg = torch.mean(torch.norm(pred_l2, dim=2)) * 0.001
+
+    # 综合损失
+    loss = l2_loss + l2_reg
+    return loss
+
 
 class EarlyStopping:
     def __init__(self, patience=10):
@@ -298,7 +368,7 @@ def build_string_repr_cache(model, dataset, cache_path=RNA_REPR_CACHE_FILE):
     cache = {}
     model.eval()
     with torch.no_grad():
-        for _, _, full_ids,_ in dataset:
+        for _, _, full_ids in dataset:
             key = ''.join([itos[idx.item()] for idx in full_ids if idx.item() != 0])
             if key in cache:
                 continue
@@ -333,19 +403,22 @@ def RNA_3D_Predictor_Train(k_folds=5):
         val_loader = DataLoader(val_subset, batch_size=8, collate_fn=collate_fn)
     
         model = SimpleCharTransformerWithRoPE(vocab_size).to(device)
-        model.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device))
+        model.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device,weights_only=True))
         model.eval()
         # 预提取每条RNA序列的全局表示（训练集与验证集都要）
-        string_repr_cache = build_string_repr_cache(model, train_subset)
-        # 验证集也加入缓存
-        string_repr_cache_val = build_string_repr_cache(model, val_subset, cache_path=RNA_PERP_CACHE_VAL_FILE)
+        train_cache_path = f"string_repr_cache_fold_{fold + 1}.pt"
+        val_cache_path = f"string_repr_cache_val_fold_{fold + 1}.pt"
+        string_repr_cache = build_string_repr_cache(model, train_subset,cache_path=train_cache_path)
+        string_repr_cache_val = build_string_repr_cache(model, val_subset, cache_path=val_cache_path)
         string_repr_cache.update(string_repr_cache_val)
 
-        rnn_model = RNN3DPredictor(input_dim=512,k=5).to(device)
+        rnn_model = RNN3DPredictor(input_dim=512,k=K).to(device)
         conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
         optimizer = optim.AdamW(rnn_model.parameters(), lr=1e-3)
-        early_stopping = EarlyStopping(patience=5)
-        for epoch in range(100):
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+        early_stopping = EarlyStopping(patience=50)
+        for epoch in range(1000):
             rnn_model.train()
             total_loss = 0
                 
@@ -359,38 +432,51 @@ def RNA_3D_Predictor_Train(k_folds=5):
                
                
                 pred_coords = rnn_model(fused)     
-                loss = tm_score_loss(pred_coords, y)
+                loss = rna_mse_loss(pred_coords, y)
                  # 调试信息
-                print(f"Loss: {loss.item()}")
+                # print(f"Loss: {loss.item()}")
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(rnn_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 total_loss += loss.item()
-            print(f"  Epoch {epoch+1}, Train Loss: {total_loss / len(train_loader):.4f}")
+            avg_train_loss = total_loss / len(train_loader)
+            scheduler.step(avg_train_loss)
+            # 打印当前学习率
+            print(f"Current Learning Rate: {scheduler.get_last_lr()[0]}")
+            print(f"  Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}")
+            # print(f"  Epoch {epoch+1}, Train Loss: {total_loss / len(train_loader):.4f}")
             
             # 验证集评估
             rnn_model.eval()
             val_loss = 0
             with torch.no_grad():
-                # for x, y, full_ids in val_loader:
                 for x, y, full_ids in tqdm(val_loader, desc=f"Fold {fold + 1},Epoch {epoch+1} [Val]"):
                     x, y, full_ids = x.to(device), y.to(device), full_ids.to(device)
                     keys = [''.join([itos[idx.item()] for idx in ids if idx.item() != 0]) for ids in full_ids]
                     full_string_repr = torch.stack([string_repr_cache[k] for k in keys]).to(device)
-                    char_emb = model.embedding(x)
-                    fused = conditioning(char_emb, full_string_repr)
-                    pred_coords = rnn_model(fused)
+                    # 滑动窗口推理
+                    pred_coords,valid_mask = infer_with_sliding_window(
+                        model=model,
+                        x=x,
+                        full_string_repr=full_string_repr,
+                        conditioning=conditioning,
+                        rnn_model=rnn_model,
+                        window_size=256,
+                        stride=128,
+                        k=5
+                    )
                     loss = tm_score_loss(pred_coords,y)
                     val_loss += loss.item()
-                val_loss = val_loss / len(val_loader)
-                print(f"  Fold {fold + 1}, Epoch {epoch + 1}, Val Loss: {val_loss:.4f}")
-                if early_stopping.step(val_loss):
-                    torch.save(rnn_model.state_dict(), RNA_RNN_MODEL_FILE)
-                    print("✅ 提前停止，最佳 RNN 模型已保存为 rna_3d_rnn_model.pth")
-                    break
-            print(f"===== Fold {fold + 1} 完成 =====")
-        print("🎉 K 折交叉验证完成！")
+                
+            avg_val_loss = val_loss / len(val_loader)
+            
+            print(f"  Val Loss (pure TM-Score): {avg_val_loss:.4f}")
+        
+            if early_stopping.step(avg_val_loss):
+                torch.save(rnn_model.state_dict(), "rna_3d_rnn_model.pth")
+                print("✅ New best model saved (rna_3d_rnn_model.pth)")
+                break
 
 
 def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_model,
@@ -432,9 +518,7 @@ def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_mode
     if (count_accum == 0).any():
         print("Warning: Some positions were not covered by the sliding window.")
     count_accum[count_accum == 0] = 1.0
-    pred_coords_s = pred_coords_accum / count_accum
-
-    # 反标准化
+    pred_coords_s = pred_coords_accum / count_accum.unsqueeze(-1).expand_as(pred_coords_accum)    # 反标准化
     pred_coords_s = pred_coords_s * COORDS_STD + COORDS_MEAN
 
     # 有效位置 mask
@@ -511,6 +595,44 @@ def generate_submission_file(model, test_seq_file, output_path, k=5):
     df.to_csv(output_path, index=False)
     print(f"✅ Submission file saved to {output_path}")
 
+def validate_rnn_model():
+        # 加载验证集数据
+        val_data = load_rna_3d_data(VALI_SEQ_FILE_PATH, VALI_LABEL_FILE_PATH, max_len=None, stride=None)
+        val_dataset = RNACoordsDataset(val_data)
+        val_loader = DataLoader(val_dataset, batch_size=8, collate_fn=collate_fn)
+
+        # 加载Transformer模型
+        transformer_model = SimpleCharTransformerWithRoPE(vocab_size).to(device)
+        transformer_model.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device,weights_only=True))
+        transformer_model.eval()
+
+        # 加载RNN模型
+        rnn_model = RNN3DPredictor(input_dim=512, k=K).to(device)
+        rnn_model.load_state_dict(torch.load(RNA_RNN_MODEL_FILE, map_location=device,weights_only=True))
+        rnn_model.eval()
+
+        # 初始化全局条件融合模块
+        conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
+
+        # 计算验证集损失
+        total_loss = 0
+        with torch.no_grad():
+            for x, y, full_ids in tqdm(val_loader, desc="Validating"):
+                x, y, full_ids = x.to(device), y.to(device), full_ids.to(device)
+                keys = [''.join([itos[idx.item()] for idx in ids if idx.item() != 0]) for ids in full_ids]
+                full_string_repr = torch.stack(
+                    [build_string_repr_cache(transformer_model, val_dataset)[k] for k in keys]
+                ).to(device)
+                char_emb = transformer_model.embedding(x)
+                fused = conditioning(char_emb, full_string_repr)
+                pred_coords = rnn_model(fused)
+                loss = tm_score_loss(pred_coords, y)
+                total_loss += loss.item()
+
+        avg_loss = total_loss / len(val_loader)
+        print(f"Validation Loss: {avg_loss:.4f}")
+        return avg_loss
+
 if __name__ == "__main__":
     RNA_3D_Predictor_Train()
     # 训练完成后生成提交文件
@@ -520,3 +642,4 @@ if __name__ == "__main__":
         output_path="submission.csv",
         k=K
     )
+    # validate_rnn_model()
