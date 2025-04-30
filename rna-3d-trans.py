@@ -442,6 +442,7 @@ def RNA_3D_Predictor_Train(k_folds=5):
                     char_emb = model.embedding(x)
                     fused = conditioning(char_emb, full_string_repr)
                     pred_coords, = trans_model(fused)
+                    pred_coords = pred_coords * COORDS_STD + COORDS_MEAN
                     loss = tm_score_loss(pred_coords,y)
                     val_loss += loss.item()
                 
@@ -480,6 +481,7 @@ def generate_submission_file(model, test_seq_file, output_path, k=5):
             string_repr = (last_hidden * mask).sum(dim=1) / valid_lengths
             fused = conditioning(char_emb, string_repr)
             pred_coords = trans_model(fused)
+            pred_coords = pred_coords * COORDS_STD + COORDS_MEAN
         
         print(f"{rna_id} 预测坐标范围:", pred_coords.min().item(), pred_coords.max().item())
         pred_coords = pred_coords.squeeze(0).cpu().numpy()  # [T, K, 3]
