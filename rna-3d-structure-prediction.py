@@ -24,6 +24,7 @@ x 坐标均值: 172.22412267209705, 方差: 111.78219610710121
 y 坐标均值: 167.04462135982504, 方差: 119.23954077924417
 z 坐标均值: 166.03082937929065, 方差: 121.29372992890671
 '''
+
 COORDS_MEAN = torch.tensor([172.2241, 167.0446, 166.0308], device=device)
 COORDS_STD = torch.tensor([111.7822, 119.2395, 121.2937], device=device)
 
@@ -194,41 +195,7 @@ def collate_fn(batch):
     full_ids = pad_sequence(full_ids, batch_first=True, padding_value=0)
     return xs, ys, full_ids
 
-class GlobalConditioning(nn.Module):
-    """
-    将字符向量与全局向量通过非线性交互方式融合。
-    支持三种方式：add（线性加和）、mlp（非线性MLP映射）、gated（门控融合）。
-    """
-    def __init__(self, dim, mode='mlp'):
-        super().__init__()
-        self.mode = mode
-        if mode == 'mlp':
-            self.fuse = nn.Sequential(
-                nn.Linear(dim * 2, dim),
-                nn.ReLU(),
-                nn.Linear(dim, dim)
-            )
-        elif mode == 'gated':
-            self.gate = nn.Sequential(
-                nn.Linear(dim * 2, dim),
-                nn.Sigmoid()
-            )
-        # 'add' 模式不需要额外参数
 
-    def forward(self, x, g):
-        # x: [B, T, D], g: [B, D]
-        B, T, D = x.shape
-        g_expanded = g.unsqueeze(1).expand(-1, T, -1)  # [B, T, D]
-        if self.mode == 'add':
-            return x + g_expanded
-        elif self.mode == 'mlp':
-            return self.fuse(torch.cat([x, g_expanded], dim=-1))
-        elif self.mode == 'gated':
-            gate = self.gate(torch.cat([x, g_expanded], dim=-1))
-            return gate * x + (1 - gate) * g_expanded
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
-        
 #使用RNN模型做预测
 class RNN3DPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=256,k=5):
@@ -413,7 +380,6 @@ def RNA_3D_Predictor_Train(k_folds=5):
         string_repr_cache.update(string_repr_cache_val)
 
         rnn_model = RNN3DPredictor(input_dim=512,k=K).to(device)
-        conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
         optimizer = optim.AdamW(rnn_model.parameters(), lr=1e-3)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
@@ -428,7 +394,8 @@ def RNA_3D_Predictor_Train(k_folds=5):
                     keys = [''.join([itos[idx.item()] for idx in ids if idx.item() != 0]) for ids in full_ids]
                     full_string_repr = torch.stack([string_repr_cache[k] for k in keys]).to(device)
                     char_emb = model.embedding(x)
-                    fused = conditioning(char_emb, full_string_repr)
+                    fused = char_emb + full_string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
+
                
                
                 pred_coords = rnn_model(fused)     
@@ -460,7 +427,6 @@ def RNA_3D_Predictor_Train(k_folds=5):
                         model=model,
                         x=x,
                         full_string_repr=full_string_repr,
-                        conditioning=conditioning,
                         rnn_model=rnn_model,
                         window_size=256,
                         stride=128,
@@ -479,7 +445,7 @@ def RNA_3D_Predictor_Train(k_folds=5):
                 break
 
 
-def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_model,
+def infer_with_sliding_window(model, x, full_string_repr, rnn_model,
                                window_size=256, stride=128, k=5):
     """
     使用滑动窗口推理并合并结果，返回反标准化坐标和有效 mask。
@@ -493,9 +459,9 @@ def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_mode
     if T <= window_size:
         # 序列长度比窗口小，直接整段处理
         with torch.no_grad():
-            fused = conditioning(model.embedding(x), full_string_repr)
+            char_emb = model.embedding(x)
+            fused = char_emb + full_string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
             pred_coords = rnn_model(fused)
-            pred_coords = pred_coords * COORDS_STD + COORDS_MEAN
         valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)
         return pred_coords, valid_mask
 
@@ -507,7 +473,8 @@ def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_mode
             continue
 
         with torch.no_grad():
-            fused = conditioning(model.embedding(x_window), full_string_repr)
+            char_emb = model.embedding(x_window)
+            fused = char_emb + full_string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
             pred_coords = rnn_model(fused)  # [B, cur_len, K, 3]
 
         # 累加到总坐标张量中
@@ -519,7 +486,6 @@ def infer_with_sliding_window(model, x, full_string_repr, conditioning, rnn_mode
         print("Warning: Some positions were not covered by the sliding window.")
     count_accum[count_accum == 0] = 1.0
     pred_coords_s = pred_coords_accum / count_accum.unsqueeze(-1).expand_as(pred_coords_accum)    # 反标准化
-    pred_coords_s = pred_coords_s * COORDS_STD + COORDS_MEAN
 
     # 有效位置 mask
     valid_mask = (count_accum.squeeze(-1) > 0)
@@ -543,22 +509,19 @@ def rna_3D_eval(input_str,k=5):
     fused_char_repr = char_emb + string_repr_expanded
 
     # 初始化 conditioning 和 rnn_model
-    conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
     rnn_model = RNN3DPredictor(input_dim=512, k=k).to(device)
     if os.path.exists("rna_3d_rnn_model.pth"):
         rnn_model.load_state_dict(torch.load(RNA_RNN_MODEL_FILE, map_location=device,weights_only=True))
     rnn_model.eval()
 
-    pred_coords,valid_mask = infer_with_sliding_window(model, fused_char_repr, string_repr, conditioning, rnn_model, window_size=256, stride=128, k=k)
+    pred_coords,valid_mask = infer_with_sliding_window(model, fused_char_repr, string_repr, rnn_model, window_size=256, stride=128, k=k)
     return pred_coords,valid_mask
 
 def generate_submission_file(model, test_seq_file, output_path, k=5):
     test_df = pd.read_csv(test_seq_file)
     rnn_model = RNN3DPredictor(input_dim=512, k=k).to(device)
-    if os.path.exists("rna_3d_rnn_model.pth"):
-        rnn_model.load_state_dict(torch.load(RNA_RNN_MODEL_FILE, map_location=device,weights_only=True))
+    rnn_model.load_state_dict(torch.load(RNA_RNN_MODEL_FILE, map_location=device,weights_only=True))
     rnn_model.eval()
-    conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
 
     model.eval()
     results = []
@@ -574,8 +537,9 @@ def generate_submission_file(model, test_seq_file, output_path, k=5):
             valid_lengths = mask.sum(dim=1)
             string_repr = (last_hidden * mask).sum(dim=1) / valid_lengths
             # fused = conditioning(char_emb, string_repr)
-            pred_coords,valid_mask = infer_with_sliding_window(model, input_tensor, string_repr, conditioning, rnn_model, k=k)
-        
+            pred_coords,valid_mask = infer_with_sliding_window(model, input_tensor, string_repr, rnn_model, k=k)
+            pred_coords_s = pred_coords_s * COORDS_STD + COORDS_MEAN
+
         print(f"{rna_id} 预测坐标范围:", pred_coords.min().item(), pred_coords.max().item())
         pred_coords = pred_coords.squeeze(0).cpu().numpy()  # [T, K, 3]
         valid_mask = valid_mask.squeeze(0).cpu().numpy()    # [T]
@@ -611,8 +575,7 @@ def validate_rnn_model():
         rnn_model.load_state_dict(torch.load(RNA_RNN_MODEL_FILE, map_location=device,weights_only=True))
         rnn_model.eval()
 
-        # 初始化全局条件融合模块
-        conditioning = GlobalConditioning(dim=512, mode='gated').to(device)
+      
 
         # 计算验证集损失
         total_loss = 0
@@ -624,7 +587,8 @@ def validate_rnn_model():
                     [build_string_repr_cache(transformer_model, val_dataset)[k] for k in keys]
                 ).to(device)
                 char_emb = transformer_model.embedding(x)
-                fused = conditioning(char_emb, full_string_repr)
+                fused = char_emb + full_string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
+
                 pred_coords = rnn_model(fused)
                 loss = tm_score_loss(pred_coords, y)
                 total_loss += loss.item()
