@@ -11,7 +11,6 @@ import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 import os
 from tqdm import tqdm
-from sklearn.model_selection import KFold
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 #const
@@ -196,7 +195,6 @@ class Trans3DPredictor(nn.Module):
         return pred_coords,confidence
 
 
-import torch
 
 def weighted_avg(coords, weights, eps=1e-8):
     """
@@ -204,10 +202,17 @@ def weighted_avg(coords, weights, eps=1e-8):
     weights: [B, T, K]
     returns: [B, T, 3]
     """
+    weights = weights.to(coords.dtype)  # 类型统一，防止 float64 × float32 报错
     weights = weights.unsqueeze(-1)  # [B, T, K, 1]
-    weighted_sum = (coords * weights).sum(dim=2)  # [B, T, 3]
-    total_weight = weights.sum(dim=2, keepdim=True) + eps  # [B, T, 1]
-    return weighted_sum / total_weight  # [B, T, 3]
+    
+    weighted_sum = torch.sum(coords * weights, dim=2)  # [B, T, 3]
+    total_weight = torch.sum(weights, dim=2)  # [B, T, 1] after unsqueeze
+    
+    # 防止除以 0（当所有 K 的 confidence 为 0）
+    total_weight = total_weight.clamp(min=eps)  # [B, T, 1]
+    
+    avg = weighted_sum / total_weight  # [B, T, 3]
+    return avg
 
 def kabsch_align(P, Q):
     """
@@ -237,7 +242,7 @@ def confidence_rmsd_loss(pred, target, confidence):
     """
     # Step 1: confidence-weighted average across K
     pred_avg = weighted_avg(pred, confidence)      # [B, T, 3]
-    target_avg =  (target, confidence)  # [B, T, 3]
+    target_avg =  weighted_avg(target, confidence)  # [B, T, 3]
 
     # Step 2: rigid alignment
     pred_aligned = kabsch_align(pred_avg, target_avg)  # [B, T, 3]
@@ -339,7 +344,12 @@ class EarlyStopping:
         self.counter = 0
 
     def step(self, current_loss):
-        if current_loss < self.best_loss:
+        if self.best_loss > 0:
+            if current_loss < self.best_loss :
+                self.best_loss = current_loss
+            self.counter = 0
+            return False
+        if current_loss < self.best_loss :
             self.best_loss = current_loss
             self.counter = 0
             return False
@@ -369,44 +379,65 @@ def dynamic_alpha(epoch, switch_epoch=10, initial_alpha=10, final_alpha=1):
         # 逐步减小 alpha，过渡到 TM-score 损失
         return max(final_alpha, initial_alpha - (epoch - switch_epoch) * (initial_alpha - final_alpha) / (100 - switch_epoch))
 
-def RNA_3D_Predictor_Train(k_folds=5):
+def RNA_3D_Predictor_Train():
     train_data = load_rna_3d_data(TRAIN_SEQ_FILE_PATH, TRAIN_LABEL_FILE_PATH)
     # 验证集：全序列
     val_data = load_rna_3d_data(VALI_SEQ_FILE_PATH, VALI_LABEL_FILE_PATH)
     train_dataset = RNACoordsDataset(train_data)
     val_dataset = RNACoordsDataset(val_data)
-    # train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
-    # val_loader = DataLoader(val_dataset, batch_size=8, collate_fn=collate_fn)
-     # 初始化 KFold
-    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=32, collate_fn=collate_fn)
     
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(train_dataset)):
-        print(f"===== Fold {fold + 1}/{k_folds} =====")
-         # 创建训练集和验证集
-        train_subset = torch.utils.data.Subset(train_dataset, train_idx)
-        val_subset = torch.utils.data.Subset(train_dataset, val_idx)
-        train_loader = DataLoader(train_subset, batch_size=8, shuffle=True, collate_fn=collate_fn)
-        val_loader = DataLoader(val_subset, batch_size=8, collate_fn=collate_fn)
+
     
-        initmodel = SimpleCharTransformerWithRoPE(vocab_size).to(device)
-        initmodel.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device,weights_only=True))
-        initmodel.eval()
-       
-       
-        trans_model = Trans3DPredictor().to(device)
-        optimizer = optim.AdamW(trans_model.parameters(), lr=1e-3)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    initmodel = SimpleCharTransformerWithRoPE(vocab_size).to(device)
+    initmodel.load_state_dict(torch.load(RNA_TRANS_MODEL_FILE, map_location=device,weights_only=True))
+    initmodel.eval()
+    
+    
+    trans_model = Trans3DPredictor().to(device)
+    optimizer = optim.AdamW(trans_model.parameters(), lr=1e-3)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
-        early_stopping = EarlyStopping(patience=30)
-        for epoch in range(1000):
-            trans_model.train()
-            total_loss = 0
-            alpha = dynamic_alpha(epoch, switch_epoch=50, initial_alpha=10, final_alpha=1)
+    early_stopping = EarlyStopping(patience=30)
+    for epoch in range(1000):
+        trans_model.train()
+        total_loss = 0
 
-            for x, y, full_ids in tqdm(train_loader, desc=f"Fold {fold + 1}, Epoch {epoch+1} [Train]"):
-                x, y,full_ids = x.to(device), y.to(device),full_ids.to(device)
+        for x, y, full_ids in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
+            x, y,full_ids = x.to(device), y.to(device),full_ids.to(device)
+            
+            # 前向传播
+            with torch.no_grad():
+                _ = initmodel(x)
+                char_emb = initmodel.embedding(x)  # [B, T, D]
+                last_hidden = initmodel.hidden_states[-1]  # [B, T, D]
+                mask = (x != 0).unsqueeze(-1).float()
+                valid_lengths = mask.sum(dim=1)  # [B, 1]
+                string_repr = (last_hidden * mask).sum(dim=1) / valid_lengths  # [B, D]
                 
-                # 前向传播
+            fused = char_emb + string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
+            pred_coords,confidence = trans_model(fused)   
+            loss = confidence_rmsd_loss(pred_coords,y,confidence)
+                # 调试信息
+            # print(f"Loss: {loss.item()}")
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trans_model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        avg_train_loss = total_loss / len(train_loader)
+        scheduler.step(avg_train_loss)
+        # 打印当前学习率
+        print(f"Current Learning Rate: {scheduler.get_last_lr()[0]}")
+        print(f"  Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}")
+        
+        # 验证集评估
+        trans_model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x, y, full_ids in tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]"):
+                x, y, full_ids = x.to(device), y.to(device), full_ids.to(device)
                 with torch.no_grad():
                     _ = initmodel(x)
                     char_emb = initmodel.embedding(x)  # [B, T, D]
@@ -414,50 +445,20 @@ def RNA_3D_Predictor_Train(k_folds=5):
                     mask = (x != 0).unsqueeze(-1).float()
                     valid_lengths = mask.sum(dim=1)  # [B, 1]
                     string_repr = (last_hidden * mask).sum(dim=1) / valid_lengths  # [B, D]
-                    
-                fused = char_emb + string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
-                pred_coords,confidence = trans_model(fused)   
-                loss = confidence_rmsd_loss(pred_coords,y,confidence)
-                 # 调试信息
-                # print(f"Loss: {loss.item()}")
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trans_model.parameters(), max_norm=1.0)
-                optimizer.step()
-                total_loss += loss.item()
-            avg_train_loss = total_loss / len(train_loader)
-            scheduler.step(avg_train_loss)
-            # 打印当前学习率
-            print(f"Current Learning Rate: {scheduler.get_last_lr()[0]}")
-            print(f"  Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}")
+                fused = char_emb + string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]
+                pred_coords,confidence = trans_model(fused)     
+                # pred_coords = pred_coords * COORDS_STD + COORDS_MEAN
+                loss = weighted_tm_score_loss(pred_coords,y,alpha=0,confidence=confidence)
+                val_loss += loss.item()
             
-            # 验证集评估
-            trans_model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for x, y, full_ids in tqdm(val_loader, desc=f"Fold {fold + 1},Epoch {epoch+1} [Val]"):
-                    x, y, full_ids = x.to(device), y.to(device), full_ids.to(device)
-                    with torch.no_grad():
-                        _ = initmodel(x)
-                        char_emb = initmodel.embedding(x)  # [B, T, D]
-                        last_hidden = initmodel.hidden_states[-1]  # [B, T, D]
-                        mask = (x != 0).unsqueeze(-1).float()
-                        valid_lengths = mask.sum(dim=1)  # [B, 1]
-                        string_repr = (last_hidden * mask).sum(dim=1) / valid_lengths  # [B, D]
-                    fused = char_emb + string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]
-                    pred_coords,confidence = trans_model(fused)     
-                    # pred_coords = pred_coords * COORDS_STD + COORDS_MEAN
-                    loss = weighted_tm_score_loss(pred_coords,y,alpha=alpha,confidence=confidence)
-                    val_loss += loss.item()
-                
-            avg_val_loss = val_loss / len(val_loader)
-            
-            print(f"  Val Loss (pure TM-Score): {avg_val_loss:.4f}")
+        avg_val_loss = val_loss / len(val_loader)
         
-            if early_stopping.step(avg_val_loss):
-                torch.save(trans_model.state_dict(), "rna_3d_model.pth")
-                print("✅ New best model saved (rna_3d_model.pth)")
-                break
+        print(f"  Val Loss (pure TM-Score): {avg_val_loss:.4f}")
+    
+        if early_stopping.step(avg_val_loss):
+            torch.save(trans_model.state_dict(), "rna_3d_model.pth")
+            print("✅ New best model saved (rna_3d_model.pth)")
+            break
 
 
 
