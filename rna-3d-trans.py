@@ -196,6 +196,59 @@ class Trans3DPredictor(nn.Module):
         return pred_coords,confidence
 
 
+import torch
+
+def weighted_avg(coords, weights, eps=1e-8):
+    """
+    coords: [B, T, K, 3]
+    weights: [B, T, K]
+    returns: [B, T, 3]
+    """
+    weights = weights.unsqueeze(-1)  # [B, T, K, 1]
+    weighted_sum = (coords * weights).sum(dim=2)  # [B, T, 3]
+    total_weight = weights.sum(dim=2, keepdim=True) + eps  # [B, T, 1]
+    return weighted_sum / total_weight  # [B, T, 3]
+
+def kabsch_align(P, Q):
+    """
+    P, Q: [B, T, 3] - predicted & target coordinates
+    returns: aligned P (rigid-body aligned to Q)
+    """
+    P_mean = P.mean(dim=1, keepdim=True)
+    Q_mean = Q.mean(dim=1, keepdim=True)
+    P_centered = P - P_mean
+    Q_centered = Q - Q_mean
+
+    H = torch.matmul(P_centered.transpose(1, 2), Q_centered)  # [B, 3, 3]
+    U, S, Vh = torch.linalg.svd(H)
+    d = torch.linalg.det(torch.matmul(Vh, U.transpose(1, 2)))
+    D = torch.diag_embed(torch.ones_like(d).repeat(3, 1).T)
+    D[:, 2, 2] = d
+    R = torch.matmul(Vh, torch.matmul(D, U.transpose(1, 2)))  # [B, 3, 3]
+
+    aligned_P = torch.matmul(P_centered, R.unsqueeze(1)) + Q_mean  # [B, T, 3]
+    return aligned_P
+
+def confidence_rmsd_loss(pred, target, confidence):
+    """
+    pred, target: [B, T, K, 3]
+    confidence: [B, T, K]
+    returns: scalar RMSD loss
+    """
+    # Step 1: confidence-weighted average across K
+    pred_avg = weighted_avg(pred, confidence)      # [B, T, 3]
+    target_avg =  (target, confidence)  # [B, T, 3]
+
+    # Step 2: rigid alignment
+    pred_aligned = kabsch_align(pred_avg, target_avg)  # [B, T, 3]
+
+    # Step 3: RMSD
+    diff = pred_aligned - target_avg
+    rmsd = torch.sqrt((diff ** 2).sum(dim=-1).mean(dim=1))  # [B]
+    return rmsd.mean()
+
+
+
 def weighted_tm_score_loss(pred, target, confidence, alpha=10,L_ref=None):
     """
     加权 TM-score 损失函数，结合置信度。
@@ -364,10 +417,7 @@ def RNA_3D_Predictor_Train(k_folds=5):
                     
                 fused = char_emb + string_repr.unsqueeze(1).expand_as(char_emb)  # [B, T, D]              
                 pred_coords,confidence = trans_model(fused)   
-                if epoch < 50:
-                    loss = rna_mse_loss(pred_coords,y)
-                else:  
-                    loss = weighted_tm_score_loss(pred_coords, y,confidence,alpha)
+                loss = confidence_rmsd_loss(pred_coords,y,confidence)
                  # 调试信息
                 # print(f"Loss: {loss.item()}")
                 optimizer.zero_grad()
